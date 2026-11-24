@@ -6,13 +6,18 @@ token file every route is refused. The token is never logged and never answered.
 
 A path is absolute and plain (no empty, "." or ".." segment), inside one of the Backend's directories, has no segment
 below that directory starting with a dot, and is never reached through a symlinked folder. The directories are the
-ones `.fathom-roots.json` beside the pack names, where an earlier Fathom wrote one, and otherwise ComfyUI's models
-directory and the directories of ComfyUI's own model folder types (`MODEL_TYPES`), as it reports them, either way leaving out any
-that is `/`, holds ComfyUI's folder, or is, holds or lies inside a `custom_nodes` directory, the pack's own folder or
-ComfyUI's user, input, output or temp directory. A link as the last segment is followed where the route says so, and only to somewhere inside
-those directories.
+model directories `.fathom-roots.json` beside the pack names, where an earlier Fathom wrote one, and otherwise ComfyUI's
+models directory and the directories of ComfyUI's own model folder types (`MODEL_TYPES`), as it reports them, either way
+leaving out any that is `/`, holds ComfyUI's folder, or is, holds or lies inside a `custom_nodes` directory, the pack's own
+folder or ComfyUI's user, input, output or temp directory; and, apart from them, the workflows folder of ComfyUI's default
+user, which the pack takes from the user directory ComfyUI reports and never from anything a request says, and which is
+the only part of the user directory served (FTH-65.4.1, FTH-65.4.2). The workflows folder is served as a plain folder in
+the user directory; where it is a link, or lies below a linked folder, it is served only while its real path is none of
+the directories a model directory may not be, and is otherwise no directory at all, decided on every request. A link as
+the last segment is followed where the route says so, and only to somewhere inside those directories.
 
-The routes list, stat and read. None writes, moves or deletes anything.
+The routes list, stat and read, and `bytes` serves a file's bytes, never one under the pack's own folder, so never the
+token file or the roots file. None writes, moves or deletes anything.
 """
 
 import asyncio
@@ -34,7 +39,8 @@ try:
 except ImportError:  # A ComfyUI older than its blake3 requirement: the version route says so, and Fathom scans over SFTP.
     blake3 = None
 
-ROUTE_VERSION = 1
+# 2 adds `bytes`, `link`, a stat's identity and the workflows folder, which a Backend without SSH needs (FTH-65.4.2).
+ROUTE_VERSION = 2
 # The version of the write routes in `pack_writes`, stated apart so a Fathom that only reads is not turned away (FTH-65.3).
 WRITES_VERSION = 1
 # The version of the fetch routes in `pack_fetch`, or none where they cannot run: without blake3, or on a Python before
@@ -57,6 +63,11 @@ MODEL_TYPES = frozenset({
 })
 # ComfyUI's own folders, which no directory of the pack's may be, hold or lie inside.
 COMFYUI_OWN = ("user", "input", "output", "temp")
+# Why nothing in ComfyUI's workflows folder is served while it leads somewhere a model directory could not be.
+WORKFLOWS_KEPT_OUT = (
+    "it is in ComfyUI's workflows folder, which leads through a link to a folder the pack never serves: the root folder, "
+    "ComfyUI's own folder, a custom_nodes folder, a node pack, or ComfyUI's user, input, output or temp folder or one in them"
+)
 
 # Bytes read at a time when hashing, and how often a hash in progress says how far it has got.
 HASH_CHUNK = 8 * 1024 * 1024
@@ -186,6 +197,43 @@ def roots(pack_dir):
     return [root for root in listed if isinstance(root, str) and root.startswith("/") and os.path.normpath(root) == root and not kept_out(root)]
 
 
+def workflows_dir():
+    """The workflows folder of ComfyUI's default user, under the user directory ComfyUI reports, or None outside ComfyUI."""
+    try:
+        import folder_paths
+
+        user = folder_paths.get_user_directory()
+    except Exception:  # noqa: BLE001  Not inside ComfyUI, or one with no user directory: there is no workflows folder.
+        return None
+    if not isinstance(user, str) or not user.startswith("/"):
+        return None
+    return os.path.join(os.path.normpath(user), "default", "workflows")
+
+
+def served_workflows(pack_dir):
+    """The workflows folder where the pack serves it, else None, decided on real paths each time it is asked.
+
+    A plain folder in the user directory, reached through no link below it, is served. One that is a link, or lies below a
+    linked folder, is served only where its real path is no directory `_kept_out` names, so a link cannot make the user
+    directory, another user's folder, ComfyUI's code or `/` readable and writable."""
+    workflows = workflows_dir()
+    if workflows is None:
+        return None
+    real = os.path.realpath(workflows)
+    user = os.path.dirname(os.path.dirname(workflows))
+    if real == os.path.join(os.path.realpath(user), "default", "workflows"):
+        return workflows
+    _, folders, own = comfyui_folders()
+    return None if _kept_out(_plain_dir(pack_dir), folders, own)(real) else workflows
+
+
+def directories(pack_dir):
+    """Every directory a path may lie in: the model directories, then the workflows folder where it is served."""
+    held = roots(pack_dir)
+    workflows = served_workflows(pack_dir)
+    return held if workflows is None or workflows in held else [*held, workflows]
+
+
 def pack_version(pack_dir):
     """The version in the marker beside the pack, written when the pack was published, or blank for a copy made another way."""
     try:
@@ -217,7 +265,7 @@ def resolve(pack_dir, path, follow_last):
         raise Refused(422, "a path must be absolute")
     if path != "/" and any(part in ("", ".", "..") for part in path[1:].split("/")):
         raise Refused(422, 'a path may not have an empty, "." or ".." segment')
-    held = roots(pack_dir)
+    held = directories(pack_dir)
     reals = [os.path.realpath(root) for root in held]
     for root, real_root in zip(held, reals):
         rel = _under(path, root)
@@ -241,6 +289,9 @@ def resolve(pack_dir, path, follow_last):
             # Its own code, so Fathom goes on over SFTP, which follows the link (FTH-65.1).
             raise Refused(403, "it resolves outside the Backend's directories", "OUTSIDE")
         return here, real
+    workflows = workflows_dir()
+    if workflows is not None and _under(path, workflows) is not None:
+        raise Refused(403, WORKFLOWS_KEPT_OUT)
     raise Refused(403, "it is outside the Backend's directories")
 
 
@@ -279,20 +330,31 @@ def _listing(path):
 def _stat_of(path, real):
     found = os.stat(path)
     kind = "file" if stat.S_ISREG(found.st_mode) else "directory" if stat.S_ISDIR(found.st_mode) else "other"
-    answer = {"type": kind, "size": found.st_size, "mtime": found.st_mtime_ns // 1_000_000_000, "real": real}
+    answer = {"type": kind, "size": found.st_size, "mtime": found.st_mtime_ns // 1_000_000_000, "real": real, "identity": _identity(found)}
     if kind == "directory":
         space = os.statvfs(path)
         answer["free"] = space.f_bavail * space.f_frsize
     return answer
 
 
+def _identity(found):
+    """Which file a stat is of, as its device and inode, which no rename changes."""
+    return f"{found.st_dev}:{found.st_ino}"
+
+
 def _no_dot_below(pack_dir, real):
     """A file is read only where its real path has no dot segment below its directory; a stat may still say where a link leads."""
-    for inside in (os.path.realpath(root) for root in roots(pack_dir)):
+    for inside in (os.path.realpath(root) for root in directories(pack_dir)):
         rel = _under(real, inside)
         if rel is not None and not _dotted(rel):
             return
     raise Refused(403, 'it resolves to a path with a segment starting with ".", which is never read')
+
+
+def _not_the_packs(pack_dir, real):
+    """Nothing under the pack's own folder is ever served, so never its token file or its roots file, wherever a directory lies."""
+    if _under(real, os.path.realpath(pack_dir)) is not None:
+        raise Refused(403, "it is in the node pack's own folder, which is never served")
 
 
 def _open_file(real):
@@ -316,8 +378,9 @@ _pushed_at_load = {}
 
 async def _version(request, pack_dir):
     return web.json_response({
-        "routes": ROUTE_VERSION, "writes": WRITES_VERSION, "fetch": FETCH_VERSION, "roots": roots(pack_dir), "blake3": blake3 is not None,
-        "pack": pack_version(pack_dir) or None, "pushed_copy": _pushed_at_load.get(pack_dir, False),
+        "routes": ROUTE_VERSION, "writes": WRITES_VERSION, "fetch": FETCH_VERSION, "roots": roots(pack_dir), "workflows": workflows_dir(),
+        "workflows_served": served_workflows(pack_dir) is not None,
+        "blake3": blake3 is not None, "pack": pack_version(pack_dir) or None, "pushed_copy": _pushed_at_load.get(pack_dir, False),
     })
 
 
@@ -523,7 +586,95 @@ async def _header(request, pack_dir):
         raise Refused(422, f"it has no header that can be read: {bad}", "BAD_HEADER") from None
 
 
-ROUTES = {"version": _version, "list": _list, "stat": _stat, "hash": _hash, "header": _header}
+def _range(request, size):
+    """The first byte and the count asked for by a `Range: bytes=start-end` header, or the whole file without one or for
+    a range from 0 of an empty file, which has no byte to name."""
+    asked = request.headers.get("Range")
+    if asked is None:
+        return 0, size, False
+    unit, _, span = asked.partition("=")
+    start, dash, end = span.partition("-")
+    if unit.strip() != "bytes" or dash != "-" or not start.isdigit() or not (end == "" or end.isdigit()):
+        raise Refused(416, "only one range of bytes, as bytes=start-end, is served")
+    first = int(start)
+    if size == 0 and first == 0:
+        return 0, 0, False
+    last = size - 1 if end == "" else min(int(end), size - 1)
+    if first > last:
+        raise Refused(416, "the range asked for is not in the file")
+    return first, last - first + 1, True
+
+
+def _open_for_bytes(real, identity):
+    """The file opened for its bytes and its stat, refused when it is not the file `identity` names."""
+    fd = _open_file(real)
+    found = os.fstat(fd)
+    if identity is not None and _identity(found) != identity:
+        os.close(fd)
+        raise Refused(409, "it is not the file it was when it was opened", "CHANGED")
+    return fd, found
+
+
+def _read_at(fd, offset, size):
+    return os.pread(fd, size, offset)
+
+
+async def _bytes(request, pack_dir):
+    """The file's bytes, streamed, all of them or one `Range`; with `?identity=`, only while it is still that file."""
+    _, real = resolve(pack_dir, _asked(request), follow_last=True)
+    _no_dot_below(pack_dir, real)
+    _not_the_packs(pack_dir, real)
+    fd, found = await _off_loop(_open_for_bytes, real, request.query.get("identity"))
+    try:
+        first, count, ranged = _range(request, found.st_size)
+        headers = {"Content-Type": "application/octet-stream", "Content-Length": str(count), "X-Fathom-Identity": _identity(found), "X-Fathom-Mtime": str(found.st_mtime_ns // 1_000_000_000)}
+        if ranged:
+            headers["Content-Range"] = f"bytes {first}-{first + count - 1}/{found.st_size}"
+        response = web.StreamResponse(status=206 if ranged else 200, headers=headers)
+        await response.prepare(request)
+        at, left = first, count
+        try:
+            while left > 0:
+                chunk = await _off_loop(_read_at, fd, at, min(HASH_CHUNK, left))
+                if not chunk:
+                    break  # Cut short: the answer ends before its length, which Fathom reads as a failure.
+                await response.write(chunk)
+                at += len(chunk)
+                left -= len(chunk)
+            if left == 0:
+                await response.write_eof()
+        except (ConnectionError, OSError):
+            pass  # Fathom stopped reading and went, or the file could not be read: the answer ends short.
+        return response
+    finally:
+        os.close(fd)
+
+
+def _link_of(pack_dir, path):
+    """The text of the link at `path`, read without following it, or None when it is not a link."""
+    if not isinstance(path, str) or not path.startswith("/") or path == "/" or "\0" in path:
+        raise Refused(422, "a path must be absolute")
+    folder, name = path.rsplit("/", 1)
+    symlinked = "it is reached through a symlinked folder, which is never followed"
+    try:
+        here, _ = resolve(pack_dir, folder or "/", follow_last=True)
+    except Refused as refused:
+        # Below a directory's real path only a link can lead out of it.
+        raise Refused(403, symlinked) if refused.code == "OUTSIDE" else refused from None
+    if os.path.islink(here):
+        raise Refused(403, symlinked)
+    if name in ("", ".", "..") or name.startswith("."):
+        raise Refused(403, 'it has a segment starting with ".", which is never read')
+    at = os.path.join(here, name)
+    return os.readlink(at) if stat.S_ISLNK(os.lstat(at).st_mode) else None
+
+
+async def _link(request, pack_dir):
+    """What the entry at `?path=` links to, as the link's own text, or null for anything that is not a link."""
+    return web.json_response({"target": await _off_loop(_link_of, pack_dir, _asked(request))})
+
+
+ROUTES = {"version": _version, "list": _list, "stat": _stat, "hash": _hash, "header": _header, "bytes": _bytes, "link": _link}
 
 
 def _guarded(pack_dir, handler):

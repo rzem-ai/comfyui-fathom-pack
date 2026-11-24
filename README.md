@@ -2,7 +2,7 @@
 
 Fathom's own ComfyUI nodes, in the Fathom category: Fathom fal, Fathom Replicate, Fathom CLIP image embed, Fathom CLIP text embed and Fathom animatic. The pack also adds routes under `/fathom/v1/` that Fathom scans this ComfyUI's models through, writes its model files through, and fetches a Download from CivitAI or Hugging Face straight onto this disk through (`fetch` and `fetch-commit`). The fetch routes need Python 3.11 or later and `blake3`; on an older Python the pack serves the rest and Fathom fetches each Download on its own machine.
 
-This copy is pack a0128322b64de091, published with Fathom v0.230.0. Its source lives in Fathom's repository at `extensions/comfyui/fathom_nodes`; change it there, not here.
+This copy is pack bf6b310240b32124, published with Fathom v0.231.0. Its source lives in Fathom's repository at `extensions/comfyui/fathom_nodes`; change it there, not here.
 
 ## Install
 

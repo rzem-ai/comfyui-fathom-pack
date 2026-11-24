@@ -2,11 +2,12 @@
 
 Every route is a POST behind the same token as the read routes in `disk_routes`, checked first, so a request without it
 touches nothing. Every path a route takes is held to the read routes' rules: absolute and plain, inside one of the
-Backend's directories, no segment below the directory starting with a dot, and never through a symlinked folder; for a
-folder reached through a link Fathom sends its real path, which must lie inside them. No path may lie in the folder
-holding the pack (`custom_nodes`), whatever directory holds it. The entry a route changes is never the directory
-itself, and a name already taken is refused with `EXISTS`, as Fathom's SFTP writer refuses it. A file or folder to
-delete in a folder that has gone is already gone, as over SFTP.
+Backend's directories (its model directories and ComfyUI's workflows folder, FTH-65.4.2), no segment below the
+directory starting with a dot, and never through a symlinked folder; for a folder reached through a link Fathom sends its
+real path, which must lie inside them. No path may lie in the folder holding the pack (`custom_nodes`), whatever
+directory holds it. The entry a route changes is never the directory itself, and a name already taken is refused with
+`EXISTS`, as Fathom's SFTP writer refuses it. A file or folder to delete in a folder that has gone is already gone, as
+over SFTP.
 
 Each change is made through a handle on the folder holding the entry, opened with `O_NOFOLLOW`, so that folder swapped
 for a link after the path was checked is refused rather than written through. A folder above it is not covered, and a
@@ -28,7 +29,7 @@ import stat
 
 from aiohttp import web
 
-from .disk_routes import PREFIX, Refused, _off_loop, _under, check_token, resolve, roots
+from .disk_routes import PREFIX, Refused, _off_loop, _under, check_token, directories, resolve
 
 # Bytes taken from the request at a time while a file is written.
 WRITE_CHUNK = 1024 * 1024
@@ -424,7 +425,7 @@ async def _unlink_placed_route(request, pack_dir):
 
 
 def _make_folders(pack_dir, here):
-    top = next((real for real in (os.path.realpath(root) for root in roots(pack_dir)) if _under(here, real) is not None), None)
+    top = next((real for real in (os.path.realpath(root) for root in directories(pack_dir)) if _under(here, real) is not None), None)
     if top is None:
         raise Refused(403, "it is outside the Backend's directories")
     missing = []
