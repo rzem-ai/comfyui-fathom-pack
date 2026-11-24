@@ -1,12 +1,13 @@
 [project]
-name = "comfyui-fathom-pack"
+name = "fathom-node-pack"
 description = "Fathom's ComfyUI nodes: fal and Replicate, CLIP image and text embeddings, the Storytime animatic, and the routes Fathom scans, writes and fetches a Backend's models through."
-version = "0.231.0"
+version = "0.237.0"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = ["blake3"]
 
 [project.urls]
-Repository = "https://github.com/rzem-ai/comfyui-fathom-pack"
+Repository = "https://github.com/rzem-ai/fathom-node-pack"
 
 [tool.comfy]
 PublisherId = "rzem-ai"
