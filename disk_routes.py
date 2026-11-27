@@ -24,6 +24,7 @@ import asyncio
 import errno
 import hashlib
 import hmac
+import importlib.util
 import json
 import math
 import os
@@ -43,9 +44,10 @@ except ImportError:  # A ComfyUI older than its blake3 requirement: the version 
 ROUTE_VERSION = 2
 # The version of the write routes in `pack_writes`, stated apart so a Fathom that only reads is not turned away (FTH-65.3).
 WRITES_VERSION = 1
-# The version of the fetch routes in `pack_fetch`, or none where they cannot run: without blake3, or on a Python before
-# 3.11, whose asyncio cannot speak TLS inside the NordVPN proxy's own TLS (FTH-65.3).
-FETCH_VERSION = 1 if blake3 is not None and sys.version_info >= (3, 11) else None
+# The version of the fetch routes in `pack_fetch`, or none where they cannot run: without blake3, aiohttp-socks or
+# cryptography, or on a Python before 3.11, whose asyncio cannot speak TLS inside an HTTPS proxy's own TLS (FTH-65.3).
+# 2 takes the route by name and the proxies and keys from the pasted pack config (FTH-146.4).
+FETCH_VERSION = 2 if blake3 is not None and sys.version_info >= (3, 11) and all(importlib.util.find_spec(name) is not None for name in ("aiohttp_socks", "cryptography")) else None
 PREFIX = "/fathom/v1"
 TOKEN_HEADER = "X-Fathom-Token"
 TOKEN_FILE = ".fathom-token"
@@ -377,7 +379,11 @@ _pushed_at_load = {}
 
 
 async def _version(request, pack_dir):
+    # Imported here, as `pack_config` builds on this module. The pack cannot check the fingerprint without the key, so it states the one pasted.
+    from . import pack_config
+
     return web.json_response({
+        "config": pack_config.state(),
         "routes": ROUTE_VERSION, "writes": WRITES_VERSION, "fetch": FETCH_VERSION, "roots": roots(pack_dir), "workflows": workflows_dir(),
         "workflows_served": served_workflows(pack_dir) is not None,
         "blake3": blake3 is not None, "pack": pack_version(pack_dir) or None, "pushed_copy": _pushed_at_load.get(pack_dir, False),

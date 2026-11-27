@@ -2,7 +2,7 @@
 
 import os
 
-from . import disk_routes, pack_fetch, pack_writes
+from . import disk_routes, pack_config, pack_fetch, pack_writes
 from .animatic import FathomAnimatic
 from .clip_embed import FathomClipImageEmbed, FathomClipTextEmbed
 from .fal import FathomFal
@@ -34,15 +34,19 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FathomAnimatic": "Fathom animatic",
 }
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+# The settings panel's Fathom section, where the pack config is pasted (FTH-146.4).
+WEB_DIRECTORY = "./web"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
 try:
     from server import PromptServer
 except ImportError:  # Outside ComfyUI, as in the tests, there is no server to add routes to.
     PromptServer = None
 
-# The read routes Fathom scans through (FTH-65.1) and the write and fetch routes it changes model files through (FTH-65.3), each behind the token beside the pack.
+# The read routes Fathom scans through (FTH-65.1), the write and fetch routes it changes model files through (FTH-65.3) and the config-key route (FTH-146.4), each behind the token beside the pack.
 if PromptServer is not None and getattr(PromptServer, "instance", None) is not None:
     disk_routes.register(PromptServer.instance.routes, os.path.dirname(os.path.abspath(__file__)))
     pack_writes.register(PromptServer.instance.routes, os.path.dirname(os.path.abspath(__file__)))
     pack_fetch.register(PromptServer.instance.routes, os.path.dirname(os.path.abspath(__file__)))
+    pack_config.register(PromptServer.instance.routes, os.path.dirname(os.path.abspath(__file__)))

@@ -2,7 +2,7 @@
 
 Fathom's own ComfyUI nodes, in the Fathom category: Fathom fal, Fathom Replicate, Fathom CLIP image embed, Fathom CLIP text embed and Fathom animatic. The pack also adds routes under `/fathom/v1/` that Fathom scans this ComfyUI's models through, writes its model files through, and fetches a Download from CivitAI or Hugging Face straight onto this disk through (`fetch` and `fetch-commit`). The fetch routes need Python 3.11 or later and `blake3`; on an older Python the pack serves the rest and Fathom fetches each Download on its own machine.
 
-This copy is pack bf6b310240b32124, published with Fathom v0.247.0. Its source lives in Fathom's repository at `extensions/comfyui/fathom_nodes`; change it there, not here.
+This copy is pack 15d7c20b8f7a874e, published with Fathom v0.249.0. Its source lives in Fathom's repository at `extensions/comfyui/fathom_nodes`; change it there, not here.
 
 ## Install
 
@@ -40,9 +40,11 @@ An earlier Fathom pushed this pack to `custom_nodes/fathom_nodes` over SSH. Comf
 
 When Fathom says to update its node pack, choose Update for Fathom node pack in ComfyUI-Manager's Install Custom Nodes list, or run `git pull` in this folder, then restart ComfyUI. `.fathom-token` and `.fathom-roots.json` are ignored by git, so they are never part of the pack ComfyUI-Manager downloads, and both a ComfyUI-Manager update and a git pull leave them in place.
 
-## Keys
+## Keys and proxies
 
-Fathom fal and Fathom Replicate read `FAL_KEY` and `REPLICATE_API_TOKEN` from `~/.config/fathom/comfyui-keys.env` for the user ComfyUI runs as, or the path in `FATHOM_KEYS_FILE`: `NAME=value` lines, mode 600. The nodes never write, print or log a key.
+Each Backend's source keys, named proxies and NordVPN credentials come from a config Fathom seals for it. In Fathom, open the Backend's Pack config tab and copy the config. Then open this ComfyUI in a browser, go to Settings, then Fathom, then Pack config, paste it into the field and close the settings. ComfyUI saves it in its own settings file and the pack reads it from there, so no restart is needed. Every secret in it is encrypted under a key only Fathom holds, which Fathom sends with each call. Paste it again whenever Fathom says the Backend's config is out of date.
+
+Fathom fal and Fathom Replicate take their keys from that config first, once Fathom has sent its key. Where the config holds none, they read `FAL_KEY` and `REPLICATE_API_TOKEN` from ComfyUI's environment, then from `~/.config/fathom/comfyui-keys.env` for the user ComfyUI runs as, or the path in `FATHOM_KEYS_FILE`: `NAME=value` lines, mode 600. The nodes never write, print or log a key.
 
 ## Licence
 

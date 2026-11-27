@@ -2,14 +2,14 @@
 
 Two POST routes behind the same token as every other, checked first:
 
-- `fetch` takes one URL, the target path, the expected size and published hash, and for this fetch alone the source's key and the proxy settings. It answers lines of JSON as it goes: `{"bytes": n}` at least once a second, `{"arrived": n}` once the last byte is on disk, then `{"verified": true, "blake3", "sha256", "bytes", "commit"}` once the file matches its published hash, or `{"error", "code"}`.
+- `fetch` takes one URL, the target path, the expected size and published hash, and the route: `none`, `nordvpn` with an `exit` and a `port`, or the name of a proxy in the pasted Fathom pack config (`pack_config`). The config's key comes in the `X-Fathom-Config-Key` header, needed for any route but `none`; the source's key and the proxy's address and credentials come from the config, opened for this fetch alone. It answers lines of JSON as it goes: `{"bytes": n}` at least once a second, `{"arrived": n}` once the last byte is on disk, then `{"verified": true, "blake3", "sha256", "bytes", "commit"}` once the file matches its published hash, or `{"error", "code"}`.
 - `fetch-commit` gives the verified file its name, on Fathom's word, so a Download cancelled before then never leaves a file under the name.
 
-Where a fetch may go: https only, on the hosts Fathom's own fetch allows for the source (`HOSTS`, Fathom's `sourceHosts`), never to a name that resolves to an address that is not public (loopback, private, link-local, shared, reserved, or one that carries or translates to an IPv4 address, `NOT_PUBLIC`), and each redirect followed by hand under the same rules, at most `MAX_REDIRECTS`. Through a proxy, the proxy resolves the source's name, so only the proxy's own address and an address written in the URL are checked here. The key goes on the first request alone, and only when its host is the source's key host (`KEY_HOSTS`, Fathom's `sourceKeyHosts`); it never follows a redirect, even to the same host, as Fathom's own fetch never lets it. A proxy is only a NordVPN HTTPS proxy on port 89 or 90. A 429 or 5xx is retried as Fathom's own fetch retries it (`ATTEMPTS`), the key going on a retry only where it went on the first try.
+Where a fetch may go: https only, on the hosts Fathom's own fetch allows for the source (`HOSTS`, Fathom's `sourceHosts`), never to a name that resolves to an address that is not public (loopback, private, link-local, shared, reserved, or one that carries or translates to an IPv4 address, `NOT_PUBLIC`), and each redirect followed by hand under the same rules, at most `MAX_REDIRECTS`. Through a proxy, the proxy resolves the source's name, so only a NordVPN exit's own address and an address written in the URL are checked here; a proxy the config names is trusted at whatever address it names, a LAN one included, as Alex decided ("the pack trusts all proxy addresses"). An HTTP or HTTPS proxy is asked to CONNECT to the name, and a SOCKS5 proxy is given the name to resolve (remote DNS), so the pack never resolves the source's name itself. The key goes on the first request alone, and only when its host is the source's key host (`KEY_HOSTS`, Fathom's `sourceKeyHosts`); it never follows a redirect, even to the same host, as Fathom's own fetch never lets it. A proxy is only one the config names, HTTP, HTTPS or SOCKS5 through `aiohttp-socks`, or a NordVPN HTTPS proxy on port 89 or 90 with the config's NordVPN credentials. A 429 or 5xx is retried as Fathom's own fetch retries it (`ATTEMPTS`), the key going on a retry only where it went on the first try.
 
 What a fetch writes: one new file, its path held to the write routes' rules in `pack_writes`, under a hidden `.fathom-write-<hex>` name beside the target until it is committed, never replacing a name; never more than the expected size and a tenth, as Fathom's own staging allows; and only where that much is free. On any failure, on a cancel (Fathom closing the stream) or with no commit within `COMMIT_SECONDS`, the hidden file is removed. At most `FETCHES_MAX` fetches run at once.
 
-The key and the proxy settings live only in the one request's handler: never logged, written, answered or kept in this module once the fetch ends.
+The config's key, the source's key and the proxy settings live only in the one request's handler: never logged, written, answered or kept in this module once the fetch ends.
 """
 
 import asyncio
@@ -24,14 +24,21 @@ import random
 import re
 import secrets
 import socket
+import ssl
 import time
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import aiohttp
 import yarl
 from aiohttp import web
 
-from . import disk_routes
+try:
+    import aiohttp_socks
+    import python_socks
+except ImportError:  # A ComfyUI without the pack's requirements: the fetch routes say so.
+    aiohttp_socks = python_socks = None
+
+from . import disk_routes, pack_config
 from .disk_routes import PREFIX, Refused, _off_loop, check_token
 from .pack_writes import NEW_FILE_MODE, _begin_write, _body, _drop_temp, _entry, _finish_write, _give_name, _write_all, connected
 
@@ -51,6 +58,10 @@ SCHEME = "https"
 PROXY_HOST = re.compile(r"^(?:[a-z0-9-]+\.)+nordvpn\.com$")
 PROXY_PORTS = (89, 90)
 PROXY_SCHEME = "https"
+NONE = "none"
+NORDVPN = "nordvpn"
+# A route name the refusal may repeat: anything else is refused without it.
+ROUTE_SHOWN = re.compile(r"^[A-Za-z0-9 ._-]{1,64}$")
 
 MAX_REDIRECTS = 5
 # A 429 or 5xx is retried as Fathom's `withRetries` does: this many attempts, the first included; Retry-After honoured up
@@ -67,8 +78,6 @@ CONNECT_SECONDS = 10
 STALL_SECONDS = 60
 COMMIT_SECONDS = 60
 USER_AGENT = "Fathom (self-hosted; model management)"
-# A bearer token or a proxy credential is visible ASCII with no spaces, as Fathom's own fetch holds a key to.
-TOKEN = re.compile(r"^[\x21-\x7e]+$")
 URL_CHARACTERS = re.compile(r"^[\x21-\x7e]+$")
 HEX = re.compile(r"^[0-9a-f]{64}$")
 
@@ -185,28 +194,45 @@ class _PublicResolver(aiohttp.abc.AbstractResolver):
         await self._inner.close()
 
 
-def _proxy_of(proxy):
-    """The proxy's address and credentials, held to NordVPN's HTTPS proxies. Raises without repeating any of it."""
-    if proxy is None:
+def _shown(route):
+    """The route's name to repeat in a refusal, where it is plain enough to, else nothing."""
+    return f" {route}" if isinstance(route, str) and ROUTE_SHOWN.fullmatch(route) else ""
+
+
+def _route_of(body):
+    """The route asked for, taken out of the body: `("none",)`, `("nordvpn", exit, port)` or `("proxy", name)`."""
+    route, exit_host, port = body.pop("route", None), body.pop("exit", None), body.pop("port", None)
+    if not isinstance(route, str) or not route:
+        raise Refused(422, "the route is none, nordvpn or the name of a proxy in this Backend's pack config", "ROUTE")
+    if route == NONE:
+        return (NONE,)
+    if route == NORDVPN:
+        if not isinstance(exit_host, str) or not PROXY_HOST.fullmatch(exit_host) or type(port) is not int or port not in PROXY_PORTS:
+            raise Refused(422, "a nordvpn route names its exit, a NordVPN proxy host, and its port, 89 or 90")
+        return (NORDVPN, exit_host, port)
+    return ("proxy", route)
+
+
+def _proxy_for(route, config):
+    """The proxy a route goes through, from the opened config alone, or None for `none`. Raises naming no setting."""
+    if route[0] == NONE:
         return None
-    refused = Refused(422, "the proxy is a NordVPN HTTPS proxy, named by host, port, username and password")
-    if not isinstance(proxy, dict):
-        raise refused
-    host, port, username, password = proxy.get("host"), proxy.get("port"), proxy.get("username"), proxy.get("password")
-    if not isinstance(host, str) or not PROXY_HOST.fullmatch(host) or type(port) is not int or port not in PROXY_PORTS:
-        raise refused
-    if not all(isinstance(value, str) and TOKEN.fullmatch(value) for value in (username, password)):
-        raise refused
-    return {"url": f"{PROXY_SCHEME}://{host}:{port}", "auth": aiohttp.BasicAuth(username, password)}
+    if route[0] == NORDVPN:
+        nordvpn = config["nordvpn"]
+        if nordvpn is None:
+            raise Refused(409, "this Backend's pack config holds no NordVPN credentials, so the nordvpn route cannot be taken", "ROUTE")
+        return {"name": "the NordVPN proxy", "public_only": True, "type": PROXY_SCHEME, "host": route[1], "port": route[2], "username": nordvpn["username"], "password": nordvpn["password"]}
+    proxy = config["proxies"].get(route[1])
+    if proxy is None:
+        raise Refused(422, f"the route{_shown(route[1])} is not a proxy in this Backend's pack config, so nothing was fetched", "ROUTE")
+    return {"name": f"the proxy{_shown(route[1])}", "public_only": False, "type": proxy["type"], "host": proxy["host"], "port": proxy["port"], "username": proxy.get("username"), "password": proxy.get("password")}
 
 
 def _asked(body):
-    """What one fetch was asked for, the key and the proxy taken out of the body so nothing else holds them."""
-    key = body.pop("key", None)
-    proxy = body.pop("proxy", None)
-    if key is not None and not (isinstance(key, str) and TOKEN.fullmatch(key)):
-        raise Refused(422, "the key is not a value a header can carry")
-    proxy = _proxy_of(proxy)
+    """What one fetch was asked for. A body that still carries a key or a proxy, as a fetch before FETCH_VERSION 2 did, is refused."""
+    if body.pop("key", None) is not None or body.pop("proxy", None) is not None:
+        raise Refused(422, "a fetch carries no key or proxy: they come from this Backend's pack config, named by the route")
+    route = _route_of(body)
     source = body.get("source")
     if source not in HOSTS:
         raise Refused(422, "the source is civitai or huggingface")
@@ -216,7 +242,24 @@ def _asked(body):
     published = body.get("published")
     if not isinstance(published, dict) or published.get("algorithm") not in ("blake3", "sha256") or not isinstance(published.get("value"), str) or not HEX.fullmatch(published["value"].lower()):
         raise Refused(422, "published is the file's blake3 or sha256")
-    return source, body.get("url"), body.get("path"), size, {"algorithm": published["algorithm"], "value": published["value"].lower()}, key, proxy
+    return source, body.get("url"), body.get("path"), size, {"algorithm": published["algorithm"], "value": published["value"].lower()}, route
+
+
+async def _opened(request, source, route):
+    """The source's key and the proxy for this fetch, from the config opened with the key the request carries. Needs the key for any route but none; with none and no key, neither."""
+    config_key = pack_config.key_from(request)
+    if config_key is None:
+        if route[0] != NONE:
+            raise Refused(422, f"the route needs this Backend's config key in the {pack_config.KEY_HEADER} header, and the request carries none", "NO_CONFIG_KEY")
+        return None, None
+    try:
+        config = await _off_loop(pack_config.open_config, config_key)
+    except pack_config.Missing:
+        # The none route needs no config: with none pasted it goes as before, with no source key. A wrong key or an invalid config still refuses.
+        if route[0] == NONE:
+            return None, None
+        raise
+    return config["keys"].get(source), _proxy_for(route, config)
 
 
 def _cap(size):
@@ -280,14 +323,60 @@ _sleep = asyncio.sleep
 _random = random.random
 
 
+def _proxy_url(proxy, host):
+    """The proxy as `aiohttp-socks` takes it, at `host`: an HTTPS proxy is an HTTP one spoken inside TLS to it."""
+    scheme = "socks5" if proxy["type"] == "socks5" else "http"
+    at = f"[{host}]" if ":" in host else host
+    auth = ""
+    if proxy["username"] is not None:
+        auth = quote(proxy["username"], safe="") + (":" + quote(proxy["password"], safe="") if proxy["password"] is not None else "") + "@"
+    return f"{scheme}://{auth}{at}:{proxy['port']}"
+
+
+def _connector(proxy, host, resolver):
+    """Straight out through the public-address resolver, or through the proxy at `host`, which resolves the source's name itself."""
+    if proxy is None:
+        return aiohttp.TCPConnector(resolver=resolver, force_close=True)
+    extra = {"rdns": True} if proxy["type"] == "socks5" else {}
+    if proxy["type"] == "https":
+        extra["proxy_ssl"] = ssl.create_default_context()
+    return aiohttp_socks.ProxyConnector.from_url(_proxy_url(proxy, host), force_close=True, **extra)
+
+
+async def _check_proxy(proxy, name):
+    """Where to reach a NordVPN exit, its own address held to the public-address rule, as aiohttp's resolver held it before
+    `aiohttp-socks`, which resolves no name through it. An HTTP proxy, as the tests make the exit, is reached at the address
+    checked; an HTTPS one by its name, which its TLS certificate is checked against, so its name is resolved again as it is
+    dialled."""
+    host = proxy["host"]
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        resolver = _PublicResolver()
+        try:
+            found = await resolver.resolve(host, proxy["port"])
+        except NotPublic:
+            raise Failed(f"{proxy['name']} resolves to an address that is not public, so nothing was sent to it.", "PRIVATE") from None
+        except OSError:
+            raise Failed(f"{proxy['name']} could not be reached for the fetch from {name}, so nothing was fetched", "PROXY") from None
+        finally:
+            await resolver.close()
+        return host if proxy["type"] == "https" else found[0]["host"]
+    if not _public(host):
+        raise Failed(f"{proxy['name']} is at an address that is not public, so nothing was sent to it.", "PRIVATE")
+    return host
+
+
 async def _download(source, url, size, key, proxy, file_fd, hashers, progress):
     """Fetches `url` into the open file, through each redirect under the same rules, retrying a 429 or 5xx as Fathom does. Raises `Failed`."""
     name = _name(source)
     cap = _cap(size)
-    resolver = _PublicResolver()
-    connector = aiohttp.TCPConnector(resolver=resolver, force_close=True)
-    timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_connect=CONNECT_SECONDS, sock_read=STALL_SECONDS)
     at = check_url(source, url)
+    # A proxy the config names is reached as it names it; only a NordVPN exit, named by the request, is held to the public-address rule.
+    proxy_host = None if proxy is None else await _check_proxy(proxy, name) if proxy["public_only"] else proxy["host"]
+    resolver = _PublicResolver()
+    connector = _connector(proxy, proxy_host, resolver)
+    timeout = aiohttp.ClientTimeout(total=None, connect=None, sock_connect=CONNECT_SECONDS, sock_read=STALL_SECONDS)
     try:
         async with aiohttp.ClientSession(connector=connector, timeout=timeout, auto_decompress=False, trust_env=False, cookie_jar=aiohttp.DummyCookieJar()) as session:
             hop = 0
@@ -302,8 +391,6 @@ async def _download(source, url, size, key, proxy, file_fd, hashers, progress):
                         yarl.URL(at, encoded=True),
                         headers=headers,
                         allow_redirects=False,
-                        proxy=None if proxy is None else proxy["url"],
-                        proxy_auth=None if proxy is None else proxy["auth"],
                     ) as answer:
                         if 300 <= answer.status < 400 and answer.status != 304:
                             location = answer.headers.get("Location")
@@ -332,10 +419,11 @@ async def _download(source, url, size, key, proxy, file_fd, hashers, progress):
                             return
                 except Failed:
                     raise
-                except (aiohttp.ClientProxyConnectionError, aiohttp.ClientHttpProxyError) as error:
-                    status = getattr(error, "status", None)
+                except (aiohttp_socks.ProxyConnectionError, aiohttp_socks.ProxyError, aiohttp_socks.ProxyTimeoutError) as error:
+                    # The library's own message names the proxy's address; only its reply code is repeated.
+                    status = getattr(error, "error_code", None)
                     said = f" (it answered {status})" if isinstance(status, int) else ""
-                    raise Failed(f"the NordVPN proxy could not carry the fetch from {name}{said}, so nothing more was fetched", "PROXY") from None
+                    raise Failed(f"{proxy['name'] if proxy else 'the proxy'} could not carry the fetch from {name}{said}, so nothing more was fetched", "PROXY") from None
                 except (asyncio.TimeoutError, aiohttp.ServerTimeoutError):
                     raise Failed(f"{name} sent nothing for {STALL_SECONDS} s, so the download was stopped", "STALLED") from None
                 except aiohttp.ClientError as error:
@@ -343,12 +431,15 @@ async def _download(source, url, size, key, proxy, file_fd, hashers, progress):
                         raise Failed(f"{resolver.refused} resolves to an address that is not public, so nothing was sent to it.", "PRIVATE") from None
                     if isinstance(error, aiohttp.ClientPayloadError):
                         raise Failed(f"the connection to {name} broke part way through the file", "UNREACHABLE") from None
+                    # An aiohttp-socks before 0.11 raises python-socks's own error for a proxy it cannot reach, an OSError aiohttp wraps as its cause.
+                    if proxy is not None and isinstance(error.__cause__, python_socks.ProxyConnectionError):
+                        raise Failed(f"{proxy['name']} could not carry the fetch from {name}, so nothing more was fetched", "PROXY") from None
                     raise Failed(f"{name} could not be reached for GET {_described(at)}", "UNREACHABLE") from None
                 # A cancel ends the wait as it ends a read, and the fetch's slot stays held through it.
                 await _sleep(wait / 1000)
                 attempt += 1
     finally:
-        # The session's requests held the key and the proxy's credentials: gone with it.
+        # The session's requests and the connector held the key and the proxy's credentials: gone with them.
         await connector.close()
 
 
@@ -375,7 +466,10 @@ async def _fetch(request, pack_dir):
     """Fetches one URL to a new file at `path`, answering lines of JSON; the file takes its name only on `fetch-commit`."""
     if disk_routes.blake3 is None:
         raise Refused(503, "this ComfyUI has no blake3 package, so the pack cannot fetch", "NO_BLAKE3")
-    source, url, path, size, published, key, proxy = _asked(await _body(request))
+    if aiohttp_socks is None or pack_config.AESGCM is None:
+        raise Refused(503, "this ComfyUI lacks the pack's aiohttp-socks or cryptography package, so the pack cannot fetch", "NO_REQUIREMENTS")
+    source, url, path, size, published, route = _asked(await _body(request))
+    key, proxy = await _opened(request, source, route)
     folder, name = _entry(pack_dir, path)
     try:
         check_url(source, url)
