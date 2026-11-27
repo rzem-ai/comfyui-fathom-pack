@@ -579,7 +579,7 @@ def _guarded(pack_dir, handler):
             check_token(request, pack_dir)
             return await handler(request, pack_dir)
         except Refused as refused:
-            return web.json_response({"error": refused.sentence, "code": refused.code}, status=refused.status)
+            return refused.answer()
         except OSError as error:
             code = disk_routes.errno.errorcode.get(error.errno, "EIO")
             return web.json_response({"error": "it could not be written", "code": code}, status=500)

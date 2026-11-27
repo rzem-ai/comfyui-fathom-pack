@@ -240,7 +240,7 @@ def register(routes, pack_dir):
             check_token(request, pack_dir)
             return await _config_key(request)
         except Refused as refused:
-            return web.json_response({"error": refused.sentence, "code": refused.code}, status=refused.status)
+            return refused.answer()
         except Exception:  # noqa: BLE001  Anything else answers alike, so no traceback goes back to the caller.
             return web.json_response({"error": "the pack could not answer", "code": "EIO"}, status=500)
 

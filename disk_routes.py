@@ -1,8 +1,13 @@
 """Read-only routes on ComfyUI's server, through which Fathom scans this Backend's models (FTH-65.1).
 
-Every route is refused, with nothing read, unless the request's `X-Fathom-Token` header holds the token in
-`.fathom-token` beside the pack, put there by the person from Fathom's Settings, compared in constant time; with no
-token file every route is refused. The token is never logged and never answered.
+Every route is refused, with nothing read, unless the request's `X-Fathom-Token` header holds the token in the pack's
+token file, put there by the person from Fathom's Settings, compared in constant time. The token file is
+`$XDG_CONFIG_HOME/fathom-node-pack/token` (`~/.config/fathom-node-pack/token` by default), or the path in
+`FATHOM_PACK_TOKEN_FILE` where that is set (FTH-155): outside the pack's folder, so a reinstall or an update by
+ComfyUI-Manager keeps it, and never in a folder ComfyUI can write, so nothing that reaches ComfyUI can swap it. With no
+token file, an unreadable one, one in a folder ComfyUI can write or one other users may read or change, every route is
+refused. On start the pack moves a `.fathom-token` an earlier pack read from its own folder to the token file
+(`move_folder_token`). The token is never logged and never answered.
 
 A path is absolute and plain (no empty, "." or ".." segment), inside one of the Backend's directories, has no segment
 below that directory starting with a dot, and is never reached through a symlinked folder. The directories are the
@@ -17,20 +22,23 @@ the directories a model directory may not be, and is otherwise no directory at a
 the last segment is followed where the route says so, and only to somewhere inside those directories.
 
 The routes list, stat and read, and `bytes` serves a file's bytes, never one under the pack's own folder, so never the
-token file or the roots file. None writes, moves or deletes anything.
+roots file or a `.fathom-token` left there. None writes, moves or deletes anything.
 """
 
 import asyncio
+import contextlib
 import errno
 import hashlib
 import hmac
 import importlib.util
 import json
+import logging
 import math
 import os
 import stat
 import struct
 import sys
+import tempfile
 import time
 
 from aiohttp import web
@@ -50,7 +58,16 @@ WRITES_VERSION = 1
 FETCH_VERSION = 2 if blake3 is not None and sys.version_info >= (3, 11) and all(importlib.util.find_spec(name) is not None for name in ("aiohttp_socks", "cryptography")) else None
 PREFIX = "/fathom/v1"
 TOKEN_HEADER = "X-Fathom-Token"
+# The file in the pack's folder an earlier pack read its token from, which ComfyUI-Manager loses on every reinstall; the
+# pack moves it to its token file on start and reads it nowhere else (FTH-155).
 TOKEN_FILE = ".fathom-token"
+# The environment variable naming the token file where `~/.config` is not the right place.
+TOKEN_FILE_ENV = "FATHOM_PACK_TOKEN_FILE"
+# The token file's folder under `$XDG_CONFIG_HOME`, and its name there.
+TOKEN_FOLDER = "fathom-node-pack"
+TOKEN_NAME = "token"
+# The most of the token file read; a token Fathom makes is 43 characters.
+TOKEN_MAX = 4096
 ROOTS_FILE = ".fathom-roots.json"
 VERSION_FILE = ".fathom-pack-version"
 # The folder under custom_nodes an earlier Fathom pushed the pack to.
@@ -92,35 +109,202 @@ GGUF_ARRAY_SHOWN = 64
 class Refused(Exception):
     """A request the pack will not answer. `sentence` never holds the token."""
 
-    def __init__(self, status, sentence, code="REFUSED"):
+    def __init__(self, status, sentence, code="REFUSED", token_file=None):
         super().__init__(sentence)
         self.status = status
         self.sentence = sentence
         self.code = code
+        # Why a token file there is not one the pack reads, for a Fathom to word: "shared" or "in_comfyui" (FTH-155).
+        self.token_file = token_file
+
+    def answer(self):
+        """The refusal as the JSON every route answers it with."""
+        body = {"error": self.sentence, "code": self.code}
+        if self.token_file is not None:
+            body["token_file"] = self.token_file
+        return web.json_response(body, status=self.status)
 
 
 class BadHeader(Exception):
     pass
 
 
-def _token_held(pack_dir):
+log = logging.getLogger("fathom_nodes")
+
+NO_TOKEN_FILE = "this Backend has no Fathom token file, so the pack serves nothing"
+TOKEN_FILE_SHARED = (
+    "this Backend's Fathom token file can be read or changed by users other than its owner, so the pack serves nothing "
+    "until it is made readable by its owner alone (chmod 600)"
+)
+TOKEN_FILE_IN_COMFYUI = (
+    "this Backend's Fathom token file is in a folder ComfyUI can write, so the pack serves nothing until it is moved "
+    "outside ComfyUI's folders"
+)
+
+
+def token_path():
+    """Where the token file is: the path in `FATHOM_PACK_TOKEN_FILE` where set, else `$XDG_CONFIG_HOME/fathom-node-pack/token`,
+    `XDG_CONFIG_HOME` counting only when absolute, as the XDG spec has it, and `~/.config` standing for it otherwise. None
+    where no absolute path comes of it, as with no home folder, so the pack serves nothing."""
+    named = os.environ.get(TOKEN_FILE_ENV)
+    if named:
+        path = os.path.expanduser(named)
+    else:
+        config = os.environ.get("XDG_CONFIG_HOME")
+        if not config or not os.path.isabs(config):
+            config = os.path.join(os.path.expanduser("~"), ".config")
+        path = os.path.join(config, TOKEN_FOLDER, TOKEN_NAME)
+    return os.path.normpath(path) if os.path.isabs(path) else None
+
+
+def in_comfyui_folders(path):
+    """Whether `path`, as written or as it really is, lies in a folder ComfyUI, its API or a node pack can write: ComfyUI's
+    own folder, its models directory and each folder type's directories (`custom_nodes` among them), or its user, input,
+    output or temp directory, the user directory holding its settings and `/userdata`. Outside ComfyUI, none."""
+    models_dir, folders, own = comfyui_folders()
+    places = [models_dir, own.get("base"), *(own.get(name) for name in COMFYUI_OWN), *(each for paths in folders.values() for each in paths)]
+    plain = {form for place in map(_plain_dir, places) if place for form in _forms(place)}
+    return any(_under(form, place) is not None for form in _forms(path) for place in plain)
+
+
+# What the version route and every other route say, beside the code TOKEN, about a token file the pack will not read, so
+# Fathom can say what to do about it; a missing or unreadable one says nothing more, as before FTH-155.
+_TOKEN_FILE_FAULTS = {TOKEN_FILE_SHARED: "shared", TOKEN_FILE_IN_COMFYUI: "in_comfyui"}
+
+# What the log has said about the token file, so a refusal is logged once and not on every request.
+_said = set()
+
+
+def _say(path, problem):
+    if (path, problem) not in _said:
+        _said.add((path, problem))
+        log.warning("Fathom node pack: %s; the token file is %s", problem, path)
+
+
+def _token_held():
+    """The token in the token file, and None; or None and why every route is refused. The file is read only where it is a
+    regular file outside ComfyUI's folders that no user but its owner may read or change, checked on the file opened."""
+    path = token_path()
+    if path is None:
+        return None, NO_TOKEN_FILE
+    if in_comfyui_folders(path):
+        _say(path, TOKEN_FILE_IN_COMFYUI)
+        return None, TOKEN_FILE_IN_COMFYUI
     try:
-        with open(os.path.join(pack_dir, TOKEN_FILE), "rb") as handle:
-            return handle.read().strip() or None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
     except OSError:
-        return None
+        return None, NO_TOKEN_FILE
+    try:
+        found = os.fstat(fd)
+        if not stat.S_ISREG(found.st_mode):
+            return None, NO_TOKEN_FILE
+        if found.st_mode & 0o077:
+            _say(path, TOKEN_FILE_SHARED)
+            return None, TOKEN_FILE_SHARED
+        data = os.read(fd, TOKEN_MAX + 1)
+    except OSError:
+        return None, NO_TOKEN_FILE
+    finally:
+        os.close(fd)
+    _said.clear()
+    held = data.strip() if len(data) <= TOKEN_MAX else b""
+    return (held, None) if held else (None, NO_TOKEN_FILE)
 
 
 def check_token(request, pack_dir):
     """Refuses the request unless it carries the token in the token file. Reads nothing else."""
-    held = _token_held(pack_dir)
+    held, problem = _token_held()
     if held is None:
-        raise Refused(403, "this Backend has no Fathom token file, so the pack serves nothing", "TOKEN")
+        raise Refused(403, problem, "TOKEN", _TOKEN_FILE_FAULTS.get(problem))
     sent = request.headers.get(TOKEN_HEADER)
     if not sent:
         raise Refused(401, "the request carries no token", "TOKEN")
     if not hmac.compare_digest(sent.encode("utf-8", "replace"), held):
         raise Refused(401, "the request carries a token that is not this Backend's", "TOKEN")
+
+
+def _read_bounded(path, follow=True):
+    """At most `TOKEN_MAX + 1` bytes of a regular file, never waiting on a fifo; with `follow` false, never through a link
+    as the last part, which raises ELOOP."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0) | (0 if follow else os.O_NOFOLLOW)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "it is not a regular file", path)
+        return os.read(fd, TOKEN_MAX + 1)
+    finally:
+        os.close(fd)
+
+
+def move_folder_token(pack_dir):
+    """Moves the `.fathom-token` an earlier pack read from its own folder to the token file, once, as ComfyUI loads the pack
+    (FTH-155). Where the token file holds none, the token is written to a temporary file beside it, owner-only, in a folder
+    made owner-only where there was none, and put in place with `os.replace`, and only then is the folder's file removed.
+    Where the token file holds the same token, the folder's file is removed, finishing a move cut short. Where it holds
+    another, the token file wins and the log says the folder's file was ignored. Nothing is moved into a folder ComfyUI can
+    write. A token file that is empty or holds only white space holds none. A `.fathom-token` that is a link is left where it
+    is, never followed, and the log says so. The log names paths and never a token."""
+    old = os.path.join(pack_dir, TOKEN_FILE)
+    try:
+        moving = _read_bounded(old, follow=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        if os.path.islink(old):
+            log.warning("Fathom node pack: %s is a link, so it was not moved; put the token in %s", old, token_path())
+            return
+        log.warning("Fathom node pack: could not read %s (%s), so it was not moved", old, error.strerror)
+        return
+    new = token_path()
+    if new is None:
+        log.warning("Fathom node pack: %s was not moved, since no home folder gives a place for the token file; set %s", old, TOKEN_FILE_ENV)
+        return
+    if os.path.realpath(new) == os.path.realpath(old):
+        return
+    if in_comfyui_folders(new):
+        log.warning("Fathom node pack: %s was not moved to %s, which is in a folder ComfyUI can write", old, new)
+        return
+    try:
+        held = _read_bounded(new).strip() if os.path.lexists(new) else b""
+    except OSError:
+        held = None
+    if held != b"":
+        if held != moving.strip():
+            log.warning("Fathom node pack: ignored %s, since %s holds another token; the pack reads only %s", old, new, new)
+            return
+        try:
+            os.remove(old)
+        except OSError as error:
+            log.warning("Fathom node pack: could not remove %s (%s), which holds the token %s holds", old, error.strerror, new)
+        return
+    folder = os.path.dirname(new)
+    try:
+        try:
+            os.makedirs(folder, mode=0o700)
+            os.chmod(folder, 0o700)
+        except FileExistsError:
+            pass
+        fd, temp = tempfile.mkstemp(dir=folder, prefix=".token-")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(moving)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, new)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(temp)
+            raise
+    except OSError as error:
+        log.warning("Fathom node pack: could not move %s to %s (%s)", old, new, error.strerror)
+        return
+    try:
+        os.remove(old)
+    except OSError as error:
+        log.warning("Fathom node pack: moved its token to %s but could not remove %s (%s)", new, old, error.strerror)
+        return
+    log.info("Fathom node pack: moved its token from %s to %s", old, new)
 
 
 def comfyui_folders():
@@ -354,7 +538,7 @@ def _no_dot_below(pack_dir, real):
 
 
 def _not_the_packs(pack_dir, real):
-    """Nothing under the pack's own folder is ever served, so never its token file or its roots file, wherever a directory lies."""
+    """Nothing under the pack's own folder is ever served, so never its roots file or a `.fathom-token` left there, wherever a directory lies."""
     if _under(real, os.path.realpath(pack_dir)) is not None:
         raise Refused(403, "it is in the node pack's own folder, which is never served")
 
@@ -691,7 +875,7 @@ def _guarded(pack_dir, handler):
             check_token(request, pack_dir)
             return await handler(request, pack_dir)
         except Refused as refused:
-            return web.json_response({"error": refused.sentence, "code": refused.code}, status=refused.status)
+            return refused.answer()
         except OSError as error:
             code = errno.errorcode.get(error.errno, "EIO")
             missing = error.errno in (errno.ENOENT, errno.ENOTDIR)

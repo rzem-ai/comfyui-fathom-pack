@@ -2,7 +2,7 @@
 
 Fathom's own ComfyUI nodes, in the Fathom category: Fathom fal, Fathom Replicate, Fathom CLIP image embed, Fathom CLIP text embed and Fathom animatic. The pack also adds routes under `/fathom/v1/` that Fathom scans this ComfyUI's models through, writes its model files through, and fetches a Download from CivitAI or Hugging Face straight onto this disk through (`fetch` and `fetch-commit`). The fetch routes need Python 3.11 or later and `blake3`; on an older Python the pack serves the rest and Fathom fetches each Download on its own machine.
 
-This copy is pack 85061b7818a26843, published with Fathom v0.252.0. Its source lives in Fathom's repository at `extensions/comfyui/fathom_nodes`; change it there, not here.
+This copy is pack a2c1b5f0b3095ae9, published with Fathom v0.253.0. Its source lives in Fathom's repository at `extensions/comfyui/fathom_nodes`; change it there, not here.
 
 ## Install
 
@@ -20,11 +20,14 @@ Then restart ComfyUI. It loads custom nodes only at start.
 
 ## The token
 
-The pack's routes answer only a request carrying this Backend's pack token. In Fathom, open the Backend in Settings > Connections and choose Make token. Fathom shows it once. Save it, on its own line, as `.fathom-token` in this folder (`custom_nodes/fathom-node-pack/.fathom-token`), owned by the user ComfyUI runs as and readable by that user alone:
+The pack's routes answer only a request carrying this Backend's pack token. In Fathom, open the Backend in Settings > Connections and choose Make token. Fathom shows it once. Save it, on its own line, as `~/.config/fathom-node-pack/token` for the user ComfyUI runs as, in a folder and a file readable by that user alone:
 
 ```sh
-chmod 600 custom_nodes/fathom-node-pack/.fathom-token
+mkdir -p -m 700 ~/.config/fathom-node-pack
+chmod 600 ~/.config/fathom-node-pack/token
 ```
+
+The file lies outside this folder, so installing, reinstalling or updating the pack keeps it. Where `XDG_CONFIG_HOME` is set, the file is `$XDG_CONFIG_HOME/fathom-node-pack/token`; to keep it elsewhere, start ComfyUI with `FATHOM_PACK_TOKEN_FILE` naming its path. The pack never reads it from a folder ComfyUI can write, such as ComfyUI's own folder, its models, input, output or temp folders or its user folder, which holds ComfyUI's settings. While the file is there but others may read or change it, the pack serves nothing and its log and its refusals say so. A `.fathom-token` an older pack kept in this folder is moved there when ComfyUI starts, unless the file already holds a token, which then wins, the log saying the folder's file was ignored.
 
 Making a new token in Fathom replaces the old one, so replace the file too. When more than one Fathom uses this ComfyUI, they share the one token: make it in one, keep it, and in each other Fathom choose Enter a token on the same Backend and paste it there, rather than making another, which would replace the file the first one needs. The pack reads it on every request, so no restart is needed. Without it the routes serve nothing: Fathom scans and writes over SFTP and fetches each Download on its own machine.
 
@@ -34,11 +37,11 @@ The routes reach only inside the model directories ComfyUI itself reports: its m
 
 ## Replacing a pushed copy
 
-An earlier Fathom pushed this pack to `custom_nodes/fathom_nodes` over SSH. ComfyUI-Manager cannot update that folder, and ComfyUI loads it beside this one. Delete `custom_nodes/fathom_nodes`, install this pack as above, move its `.fathom-token` into this folder or make a new token in Fathom, then restart ComfyUI.
+An earlier Fathom pushed this pack to `custom_nodes/fathom_nodes` over SSH. ComfyUI-Manager cannot update that folder, and ComfyUI loads it beside this one. Delete `custom_nodes/fathom_nodes`, install this pack as above, move its `.fathom-token` to `~/.config/fathom-node-pack/token` or make a new token in Fathom, then restart ComfyUI.
 
 ## Update
 
-When Fathom says to update its node pack, choose Update for Fathom node pack in ComfyUI-Manager's Install Custom Nodes list, or run `git pull` in this folder, then restart ComfyUI. `.fathom-token` and `.fathom-roots.json` are ignored by git, so they are never part of the pack ComfyUI-Manager downloads, and both a ComfyUI-Manager update and a git pull leave them in place.
+When Fathom says to update its node pack, choose Update for Fathom node pack in ComfyUI-Manager's Install Custom Nodes list, or run `git pull` in this folder, then restart ComfyUI. The token file lies outside this folder, so an update keeps it. `.fathom-roots.json` and a `.fathom-token` an older pack left are ignored by git, so they are never part of the pack ComfyUI-Manager downloads, and both a ComfyUI-Manager update and a git pull leave them in place.
 
 ## Keys and proxies
 

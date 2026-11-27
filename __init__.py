@@ -44,8 +44,10 @@ try:
 except ImportError:  # Outside ComfyUI, as in the tests, there is no server to add routes to.
     PromptServer = None
 
-# The read routes Fathom scans through (FTH-65.1), the write and fetch routes it changes model files through (FTH-65.3) and the config-key route (FTH-146.4), each behind the token beside the pack.
+# The read routes Fathom scans through (FTH-65.1), the write and fetch routes it changes model files through (FTH-65.3) and the config-key route (FTH-146.4), each behind the token in the pack's token file,
+# to which a `.fathom-token` an earlier pack read from its own folder is moved first (FTH-155).
 if PromptServer is not None and getattr(PromptServer, "instance", None) is not None:
+    disk_routes.move_folder_token(os.path.dirname(os.path.abspath(__file__)))
     disk_routes.register(PromptServer.instance.routes, os.path.dirname(os.path.abspath(__file__)))
     pack_writes.register(PromptServer.instance.routes, os.path.dirname(os.path.abspath(__file__)))
     pack_fetch.register(PromptServer.instance.routes, os.path.dirname(os.path.abspath(__file__)))

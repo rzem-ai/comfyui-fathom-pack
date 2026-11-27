@@ -1,7 +1,7 @@
 [project]
 name = "fathom-node-pack"
 description = "Fathom's ComfyUI nodes: fal and Replicate, CLIP image and text embeddings, the Storytime animatic, and the routes Fathom scans, writes and fetches a Backend's models through."
-version = "0.252.0"
+version = "0.253.0"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = ["blake3", "aiohttp-socks>=0.10", "cryptography>=41"]
