@@ -2,11 +2,15 @@
 
 Fathom's own ComfyUI nodes, in the Fathom category: Fathom fal, Fathom Replicate, Fathom CLIP image embed, Fathom CLIP text embed and Fathom animatic. The pack also adds routes under `/fathom/v1/` that Fathom scans this ComfyUI's models through, writes its model files through, and fetches a Download from CivitAI or Hugging Face straight onto this disk through (`fetch` and `fetch-commit`). The fetch routes need Python 3.11 or later and `blake3`; on an older Python the pack serves the rest and Fathom fetches each Download on its own machine.
 
-This copy is pack a2c1b5f0b3095ae9, published with Fathom v0.253.0. Its source lives in Fathom's repository at `extensions/comfyui/fathom_nodes`; change it there, not here.
+This copy is pack a2c1b5f0b3095ae9, published with Fathom v0.259.0. Its source lives in Fathom's repository at `extensions/comfyui/fathom_nodes`; change it there, not here.
 
 ## Install
 
-In ComfyUI-Manager, open the Install Custom Nodes list, find Fathom node pack and choose Install, then restart ComfyUI. ComfyUI-Manager installs it from the Comfy Registry into `custom_nodes/fathom-node-pack` with its requirements, at its default security level and on a ComfyUI that listens on the network too.
+In ComfyUI-Manager, open the Install Custom Nodes list, find Fathom node pack and choose Install, then restart ComfyUI. ComfyUI-Manager installs it from the Comfy Registry into `custom_nodes/fathom-node-pack` with its requirements.
+
+On a ComfyUI that listens beyond 127.0.0.1, this pack's install expects `security_level = normal` and `network_mode = personal_cloud` in `[default]` of ComfyUI-Manager's `config.ini`, then a restart of ComfyUI.
+
+While the Registry holds this pack's versions as Flagged, ComfyUI-Manager 4.4.3 installs one on such a ComfyUI only with `fathom-node-pack` on a line of `<USER_DIRECTORY>/__manager/nodepack-whitelist.list`, or with `allow_flagged_nodepack_install = true` in `[default]` of `config.ini`. `network_mode = personal_cloud` alone does not allow it. Add the whitelist line first: it allows this pack alone, and Manager reads the file on every install check, so no restart is needed. `<USER_DIRECTORY>` is `<ComfyUI>/user` unless ComfyUI starts with `--user-directory`. The setting allows every Flagged pack, so set it only on a ComfyUI that your own network alone can reach, and restart ComfyUI after saving `config.ini`. When Manager refuses, ComfyUI's UI says only that the current security configuration does not allow the action; the terminal ComfyUI runs in gives the reason.
 
 Or clone it into ComfyUI's `custom_nodes` and install its requirements in ComfyUI's Python:
 
